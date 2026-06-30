@@ -324,7 +324,7 @@ squid-proxy/
 
 ## 许可证
 
-内部项目，仅供 Envision Energy 使用。
+内部项目，仅供使用。
 
 ---
 
