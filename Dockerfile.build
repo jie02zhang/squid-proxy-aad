@@ -1,0 +1,60 @@
+# ============================================================
+# Stage 1: 编译 Squid（只构建一次，或升级版本时重构建）
+# 用法：
+#   初始构建：docker build -f Dockerfile.build --build-arg SQUID_VER=7.6 -t squid-proxy-aad:7.6 .
+#   升级 7.7：docker build -f Dockerfile.build --build-arg SQUID_VER=7.7 -t squid-proxy-aad:7.7 .
+# ============================================================
+
+FROM ubuntu:24.04
+
+# ---- 定义 Squid 版本（升级时只改 --build-arg SQUID_VER=xxx）----
+ARG SQUID_VER=7.6
+
+LABEL maintainer="Envision Energy"
+LABEL description="Squid ${SQUID_VER} (source build) + OpenSSL - base image"
+LABEL version="${SQUID_VER}"
+
+ENV TZ=Asia/Shanghai
+ENV DEBIAN_FRONTEND=noninteractive
+ENV SQUID_VER=${SQUID_VER}
+
+# ---- 编译依赖 ----
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential wget curl ca-certificates openssl \
+        libssl-dev zlib1g-dev libexpat1-dev xz-utils \
+        dnsutils vim-tiny less procps tzdata \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# ---- 复制 Bootstrapped 源码包（文件名格式：squid-<VER>.tar.xz）----
+COPY squid-${SQUID_VER}.tar.xz /tmp/squid-src.tar.xz
+
+RUN cd /tmp && \
+    tar xf squid-src.tar.xz && \
+    cd squid-${SQUID_VER} && \
+    ./configure \
+        --prefix=/usr \
+        --localstatedir=/var \
+        --sysconfdir=/etc/squid \
+        --libexecdir=/usr/lib/squid \
+        --datadir=/usr/share/squid \
+        --with-logdir=/var/log/squid \
+        --with-pidfile=/run/squid.pid \
+        --with-openssl \
+        --enable-ssl-crtd \
+        --enable-auth-basic=DB \
+        --disable-auth-ntlm \
+        --disable-auth-negotiate \
+        --enable-linux-netfilter \
+        --without-systemd && \
+    make -j$(nproc) && make install && \
+    ldconfig && \
+    rm -rf /tmp/squid*
+
+# 验证安装
+RUN squid -v && echo "Squid ${SQUID_VER} built successfully"
+
+# 创建数据目录
+RUN mkdir -p /data/log /data/run /data/cache /etc/squid/certs && \
+    chown -R proxy:proxy /data /etc/squid/certs

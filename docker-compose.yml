@@ -1,0 +1,79 @@
+# ============================================================
+# Squid + Azure AD ROPC 正向代理网关 - Docker Compose v23
+# 
+# 项目说明：
+#   基于 Squid 7.6 的正向代理网关，集成 Azure AD 认证。
+#   用户通过在浏览器/系统代理设置中填写 AAD 账号密码完成认证。
+#
+# 首次部署：
+#   1. 构建基础镜像（编译 Squid）：
+#      docker build -f Dockerfile.build --build-arg SQUID_VER=7.6 -t squid-proxy-aad:7.6 .
+#   2. 启动服务：
+#      docker compose up -d --build
+#
+# 升级 Squid 版本：
+#   1. 下载新版源码 squid-<NEW_VER>.tar.xz 放到项目目录
+#   2. 重新构建基础镜像：
+#      docker build -f Dockerfile.build --build-arg SQUID_VER=<NEW_VER> -t squid-proxy-aad:<NEW_VER> .
+#   3. 修改下方 SQUID_VER 为 <NEW_VER>
+#   4. 重启服务：
+#      docker compose up -d --build
+#
+# 环境变量配置：
+#   复制 .env.example 为 .env，填入真实的 AAD 配置：
+#   - AAD_TENANT_ID     : Azure AD 租户 ID
+#   - AAD_CLIENT_ID     : Azure AD 应用 ID
+#   - AAD_CLIENT_SECRET : Azure AD 应用密钥
+#   - PROXY_HOSTNAME    : 代理服务器域名或 IP
+# ============================================================
+
+version: "3.9"
+
+services:
+  squid:
+    # 构建配置
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SQUID_VER: "7.6"          # Squid 版本（与基础镜像 tag 一致）
+    image: squid-proxy-aad:7.6     # 镜像名称（包含版本号）
+    container_name: squid-proxy-aad  # 容器名称（便于 docker logs 查看日志）
+    restart: unless-stopped         # 自动重启（除非手动停止）
+    
+    # 端口映射
+    ports:
+      - "3128:3128"   # HTTPS 代理（主端口，TLS 加密）
+      # - "3129:3129"   # HTTP 代理（已禁用，只保留 HTTPS）
+    
+    # 数据卷挂载（持久化配置和日志）
+    volumes:
+      # Squid 主配置（只读，entrypoint.sh 会复制到 /tmp 后修改）
+      - ./config/squid.conf:/etc/squid/squid.conf:ro
+      # AAD 认证脚本（entrypoint.sh 会复制到 /tmp 并处理 \r）
+      - ./scripts/squid_aad_auth.sh:/usr/local/bin/squid_aad_auth.sh
+      # 持久化数据目录（proxy 用户需要写权限）
+      - /data/squid/cache:/data/cache   # 缓存目录（当前未使用，保留扩展）
+      - /data/squid/log:/data/log       # 日志目录（cache.log, auth_cache/）
+      - /data/squid/run:/data/run       # PID 文件目录
+      # 注意：证书已打包进镜像（config/certs/），不需要单独挂载
+      # 如需使用宿主机证书，取消下面这行的注释：
+      # - /data/squid/certs:/etc/squid/certs:ro
+    
+    # 环境变量（从 .env 文件读取）
+    environment:
+      - TZ=Asia/Shanghai                           # 时区（日志时间）
+      # 代理服务器主机名（用于 Squid 日志和错误页面）
+      # 测试环境用 IP 或 test.com，生产环境用实际域名（如 proxy.company.com）
+      - PROXY_HOSTNAME=${PROXY_HOSTNAME:-proxy.test.com}
+      # Azure AD 配置（必须从 .env 文件读取，不要写死在这里）
+      - AAD_TENANT_ID=${AAD_TENANT_ID}           # Azure AD 租户 ID
+      - AAD_CLIENT_ID=${AAD_CLIENT_ID}             # Azure AD 应用 ID
+      - AAD_CLIENT_SECRET=${AAD_CLIENT_SECRET}       # Azure AD 应用密钥
+    
+    # 日志配置（Docker 日志驱动）
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"   # 单个日志文件最大 100MB
+        max-file: "5"       # 最多保留 5 个日志文件
