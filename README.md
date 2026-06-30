@@ -1,12 +1,16 @@
-# Squid + Azure AD ROPC 正向代理网关
+# Squid + Azure AD ROPC + MFA 正向代理网关
 
 ## 项目简介
 
-基于 **Squid 7.6** 的正向代理网关，集成 **Azure AD** 认证（ROPC 密码模式）。用户通过在浏览器/系统代理设置中填写 AAD 账号密码完成认证，支持 HTTPS 代理（TLS 加密）。
+基于 **Squid 7.6** 的正向代理网关，集成 **Azure AD** 认证，支持两种认证模式：
+
+1. **ROPC 模式**（Resource Owner Password Credentials）：适合脚本、非浏览器应用
+2. **MFA 模式**（Authorization Code Flow + MFA）：适合浏览器用户，支持 Azure AD MFA 验证
 
 ### 核心特性
 
-- ✅ **Azure AD 集成**：用户使用 AAD 账号密码直接认证（无需额外登录页）
+- ✅ **双模式认证**：ROPC（3128 端口）+ MFA（3129 端口）
+- ✅ **Azure AD MFA 支持**：用户通过浏览器登录，支持多因素认证
 - ✅ **HTTPS 代理**：用户 → 代理走 TLS 加密（需要证书）
 - ✅ **本地认证缓存**：认证成功后缓存 1 小时，减少 AAD API 调用 100 倍
 - ✅ **高并发支持**：100 个认证进程 + 4 个 Squid worker（适配 4 核 CPU）
@@ -17,12 +21,14 @@
 
 ## 架构说明
 
+### 模式 1：ROPC 认证（3128 端口）
+
 ```
 ┌─────────────────┐
 │   浏览器/系统代理设置                          │
-│   填写 AAD 账号密码                          │
+│   填写 AAD 账号密码（Basic Auth）             │
 └─────────────────┬─────────────────────────┘
-                  │ HTTPS (TLS)
+                  │ HTTPS (TLS) - 端口 3128
                   ▼
 ┌─────────────────┐
 │   Squid 7.6 (Docker 容器)                │
@@ -39,17 +45,49 @@
 └─────────────────┘
 ```
 
-### 认证流程
+**使用场景**：自动化脚本、curl 请求、非浏览器应用
 
-1. 用户在浏览器代理设置中填写 AAD 账号密码
-2. Squid 收到请求，调用 `squid_aad_auth.sh` 脚本
-3. 脚本先查本地缓存（`/data/log/auth_cache/`）
-   - **缓存命中**（< 1 小时）→ 直接返回 OK（< 1ms）
-   - **缓存未命中** → 调用 Azure AD ROPC 接口
-4. Azure AD 验证用户名密码
-   - **成功** → 写入缓存，返回 OK
-   - **失败** → 返回 ERR（拒绝访问）
-5. Squid 允许/拒绝用户访问目标网站
+---
+
+### 模式 2：MFA 认证（3129 端口）
+
+```
+┌─────────────────┐
+│   浏览器用户                                  │
+│   访问 http://<proxy>:3129/login            │
+└─────────────────┬─────────────────────────┘
+                  │
+                  ▼
+┌─────────────────┐
+│   OAuth2 Proxy (Docker 容器)               │
+│   - 重定向到 Azure AD 登录页面             │
+│   - 用户输入账号密码 + MFA 验证            │
+│   - 登录成功 → 设置 Cookie                │
+└─────────────────┬─────────────────────────┘
+                  │
+                  ▼
+┌─────────────────┐
+│   Squid 7.6 (Docker 容器)                │
+│   - 监听 3129 端口 (HTTPS)              │
+│   - 验证 OAuth2 Proxy Cookie            │
+│   - Cookie 有效 → 允许访问目标网站       │
+└─────────────────┘
+```
+
+**使用场景**：浏览器访问、需要 MFA 验证的场景
+
+---
+
+## 认证模式对比
+
+| 特性 | ROPC 模式（3128） | MFA 模式（3129） |
+|------|-------------------|------------------|
+| 认证方式 | Basic Auth（用户名/密码） | OAuth2 Cookie（浏览器登录） |
+| MFA 支持 | ❌ 不支持 | ✅ 支持 |
+| 使用场景 | 脚本、curl、非浏览器应用 | 浏览器用户 |
+| 安全性 | 中（密码传输） | 高（Cookie + MFA） |
+| 用户体验 | 需要配置代理用户名密码 | 浏览器登录（友好） |
+| Azure AD 应用配置 | 需要 ROPC 权限 | 需要 Redirect URI |
 
 ---
 
@@ -90,15 +128,24 @@ vim .env
 
 ```bash
 # 代理服务器主机名（域名或 IP）
-# - 生产环境：spproxy.test.com
+# - 生产环境：proxy.test.com
 # - 测试环境：172.23.95.36
-PROXY_HOSTNAME=spproxy.test.com
+PROXY_HOSTNAME=proxy.test.com
 
 # Azure AD 配置（从 Azure Portal 获取）
-AAD_TENANT_ID=20e8dfa9-4087-428e-865a-329bac3297da
-AAD_CLIENT_ID=a3b622a2-df7d-453d-a9f8-c50c5b1869b9
-AAD_CLIENT_SECRET=your_secret_here
+# 用于 ROPC 认证（3128 端口）和 MFA 认证（3129 端口）
+AAD_TENANT_ID=your-tenant-id-here
+AAD_CLIENT_ID=your-client-id-here
+AAD_CLIENT_SECRET=your-client-secret-here
+
+# OAuth2 Proxy Cookie 加密密钥（必须 43+ 字符）
+# 生成方式：python3 -c "import secrets; print(secrets.token_urlsafe(43))"
+OAUTH2_PROXY_COOKIE_SECRET=your-cookie-secret-here-minimum-43-characters-long
 ```
+
+**注意**：
+- `OAUTH2_PROXY_COOKIE_SECRET` 必须 ≥ 43 个字符
+- 不要使用特殊字符（如 `@`, `#`, `$` 等），可能导致配置错误
 
 ### 3. 放置证书
 
@@ -158,6 +205,70 @@ docker compose restart squid
 - 下次认证时，检查文件修改时间
   - **< 1 小时** → 直接返回 OK（不调 AAD）
   - **≥ 1 小时** → 删除缓存文件，调用 AAD
+
+### OAuth2 Proxy 配置（`config/oauth2-proxy.cfg`）
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `provider` | OAuth2 提供程序 | `azure` |
+| `azure_tenant_id` | Azure AD 租户 ID | 从环境变量读取 |
+| `client_id` | Azure AD 应用 ID | 从环境变量读取 |
+| `client_secret` | Azure AD 应用密钥 | 从环境变量读取 |
+| `cookie_secret` | Cookie 加密密钥 | 从环境变量读取 |
+| `redirect_url` | 回调 URL | `https://<proxy>:3129/oauth2/callback` |
+| `cookie_expire` | Cookie 有效期 | `24h` |
+
+**修改配置后重启**：
+
+```bash
+docker compose restart oauth2-proxy
+```
+
+---
+
+## MFA 认证使用说明
+
+### 1. 登录（获取 Cookie）
+
+用户需要先登录，获取 OAuth2 Proxy Cookie：
+
+1. 在浏览器中访问：
+   ```
+   https://<proxy-hostname>:3129/login
+   ```
+
+2. 点击"登录"按钮，跳转到 Azure AD 登录页面
+
+3. 输入账号密码，完成 MFA 验证（如果需要）
+
+4. 登录成功后，OAuth2 Proxy 设置 Cookie（`_oauth2_proxy`）
+
+5. 用户访问任何网站，Squid 验证 Cookie → 允许访问
+
+### 2. 配置浏览器使用 MFA 认证（3129 端口）
+
+**注意**：MFA 认证需要浏览器支持 Cookie，不能通过 Basic Auth 配置。
+
+**推荐方案**：使用浏览器扩展（如 SwitchyOmega）配置代理：
+
+1. 安装 SwitchyOmega 扩展
+2. 添加代理服务器：
+   - 协议：HTTPS
+   - 服务器：`<proxy-hostname>`
+   - 端口：`3129`
+3. 启用代理，访问任何网站
+4. 首次访问会提示登录（重定向到登录页面）
+5. 登录成功后，自动访问目标网站
+
+### 3. 登出
+
+用户可以通过以下 URL 登出：
+
+```
+https://<proxy-hostname>:3129/oauth2/sign_out
+```
+
+登出后，Cookie 被删除，需要重新登录。
 
 ---
 

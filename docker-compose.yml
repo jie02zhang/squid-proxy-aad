@@ -1,9 +1,15 @@
 # ============================================================
-# Squid + Azure AD ROPC 正向代理网关 - Docker Compose v23
+# Squid + Azure AD MFA 正向代理网关 - Docker Compose v23
 # 
 # 项目说明：
-#   基于 Squid 7.6 的正向代理网关，集成 Azure AD 认证。
-#   用户通过在浏览器/系统代理设置中填写 AAD 账号密码完成认证。
+#   基于 Squid 7.6 的正向代理网关，集成 Azure AD MFA 认证。
+#   用户通过浏览器访问登录页面，完成 Azure AD MFA 验证后使用代理。
+#
+# 认证流程：
+#   1. 用户访问任何网站 → Squid 检查 Cookie
+#   2. 无 Cookie → 返回 302 重定向到 OAuth2 Proxy 登录页面
+#   3. 用户完成 Azure AD MFA 验证 → OAuth2 Proxy 设置 Cookie
+#   4. 用户再次访问 → Squid 验证 Cookie → 允许访问
 #
 # 首次部署：
 #   1. 构建基础镜像（编译 Squid）：
@@ -25,11 +31,66 @@
 #   - AAD_CLIENT_ID     : Azure AD 应用 ID
 #   - AAD_CLIENT_SECRET : Azure AD 应用密钥
 #   - PROXY_HOSTNAME    : 代理服务器域名或 IP
+#   - OAUTH2_PROXY_COOKIE_SECRET : OAuth2 Proxy Cookie 加密密钥（43+ 字符）
 # ============================================================
 
 version: "3.9"
 
 services:
+  # ==========================================
+  # OAuth2 Proxy 服务（处理 Azure AD MFA 认证）
+  # ==========================================
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.6.0
+    container_name: squid-oauth2-proxy
+    restart: unless-stopped
+    
+    # 端口映射
+    ports:
+      - "4180:4180"   # OAuth2 Proxy HTTP 端口
+      - "8443:8443"   # OAuth2 Proxy HTTPS 端口（可选）
+    
+    # 环境变量（从 .env 文件读取）
+    environment:
+      - OAUTH2_PROXY_PROVIDER=azure
+      - OAUTH2_PROXY_AZURE_TENANT_ID=${AAD_TENANT_ID}
+      - OAUTH2_PROXY_CLIENT_ID=${AAD_CLIENT_ID}
+      - OAUTH2_PROXY_CLIENT_SECRET=${AAD_CLIENT_SECRET}
+      - OAUTH2_PROXY_COOKIE_SECRET=${OAUTH2_PROXY_COOKIE_SECRET}
+      
+      # 回调 URL（登录成功后重定向到此处）
+      - OAUTH2_PROXY_REDIRECT_URL=https://${PROXY_HOSTNAME:-proxy.test.com}/oauth2/callback
+      
+      # Cookie 域名（必须与代理域名一致）
+      - OAUTH2_PROXY_COOKIE_DOMAIN=${PROXY_HOSTNAME:-proxy.test.com}
+      
+      # 监听地址
+      - OAUTH2_PROXY_HTTP_ADDRESS=0.0.0.0:4180
+      
+      # 跳过证书验证（测试环境）
+      - OAUTH2_PROXY_INSECURE_OIDC_ALLOW_UNVERIFIED_EMAIL=true
+      
+      # 认证通过后，显示用户信息
+      - OAUTH2_PROXY_SHOW_DEBUG_ON_ERROR=true
+      
+      # Cookie 有效期（24 小时）
+      - OAUTH2_PROXY_COOKIE_EXPIRE=24h
+      
+      # 会话有效期（24 小时）
+      - OAUTH2_PROXY_SESSION_EXPIRATION=24h
+    
+    networks:
+      - squid-network
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+  # ==========================================
+  # Squid 代理服务
+  # ==========================================
   squid:
     # 构建配置
     build:
@@ -50,8 +111,10 @@ services:
     volumes:
       # Squid 主配置（只读，entrypoint.sh 会复制到 /tmp 后修改）
       - ./config/squid.conf:/etc/squid/squid.conf:ro
-      # AAD 认证脚本（entrypoint.sh 会复制到 /tmp 并处理 \r）
-      - ./scripts/squid_aad_auth.sh:/usr/local/bin/squid_aad_auth.sh
+      # OAuth2 Cookie 验证脚本
+      - ./scripts/squid_oauth_validate.sh:/usr/local/bin/squid_oauth_validate.sh
+      # 自定义错误页面（重定向到登录）
+      - ./config/error_pages:/usr/share/squid/errors/custom:ro
       # 持久化数据目录（proxy 用户需要写权限）
       - /data/squid/cache:/data/cache   # 缓存目录（当前未使用，保留扩展）
       - /data/squid/log:/data/log       # 日志目录（cache.log, auth_cache/）
@@ -66,10 +129,15 @@ services:
       # 代理服务器主机名（用于 Squid 日志和错误页面）
       # 测试环境用 IP 或 test.com，生产环境用实际域名（如 proxy.company.com）
       - PROXY_HOSTNAME=${PROXY_HOSTNAME:-proxy.test.com}
-      # Azure AD 配置（必须从 .env 文件读取，不要写死在这里）
-      - AAD_TENANT_ID=${AAD_TENANT_ID}           # Azure AD 租户 ID
-      - AAD_CLIENT_ID=${AAD_CLIENT_ID}             # Azure AD 应用 ID
-      - AAD_CLIENT_SECRET=${AAD_CLIENT_SECRET}       # Azure AD 应用密钥
+      # OAuth2 Proxy 服务地址（用于 Cookie 验证）
+      - OAUTH2_PROXY_URL=http://oauth2-proxy:4180
+    
+    # 依赖关系（先启动 oauth2-proxy）
+    depends_on:
+      - oauth2-proxy
+    
+    networks:
+      - squid-network
     
     # 日志配置（Docker 日志驱动）
     logging:
@@ -77,3 +145,8 @@ services:
       options:
         max-size: "100m"   # 单个日志文件最大 100MB
         max-file: "5"       # 最多保留 5 个日志文件
+
+# 自定义网络（Squid 和 OAuth2 Proxy 通信）
+networks:
+  squid-network:
+    driver: bridge
