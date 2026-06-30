@@ -441,5 +441,5 @@ squid-proxy/
 
 ## 联系方式
 
-- **维护者**：Envision Energy IT 部门
+- **维护者**： 部门
 - **问题反馈**：请联系 IT 部门或提交 Issue
